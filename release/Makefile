@@ -1,0 +1,88 @@
+## This Makefile should only be called from the project root Makefile ##
+
+# Needed for glob expansion.
+SHELL = /bin/bash
+.SHELLFLAGS = -O extglob -c
+
+# Dry run flags.
+ifneq ($(DRY_RUN),)
+SNAPSHOT_FLAGS = --snapshot --skip-publish --rm-dist
+endif
+
+# Ensure that this Makefile is run from the project root (always contains the 'cmd/' directory).
+ifeq (,$(wildcard cmd))
+	$(error "This Makefile must be invoked from the operator-sdk project root")
+endif
+
+##@ Release
+
+.PHONY: release
+release: ## Publish an operator-sdk release, with option for a dry run with DRY_RUN.
+ifeq (,$(GIT_VERSION))
+	$(error "GIT_VERSION must be set to a git tag")
+endif
+	$(SCRIPTS_DIR)/fetch goreleaser 0.147.2
+	GORELEASER_CURRENT_TAG=$(GIT_VERSION) $(TOOLS_DIR)/goreleaser $(SNAPSHOT_FLAGS) --release-notes=changelog/generated/$(GIT_VERSION).md --parallelism 5
+
+##@ Pre-Release
+
+.PHONY: check_release_version
+check_release_version:
+ifeq (,$(RELEASE_VERSION))
+	$(error "RELEASE_VERSION must be set to a release tag")
+endif
+
+.PHONY: prerelease
+prerelease: check_release_version changelog ## Create release commit changes to commit.
+	./website/scripts/update_branch_mappings.sh $(RELEASE_VERSION)
+
+.PHONY: changelog
+changelog: check_release_version ## Generate the changelog.
+	@mkdir -p changelog/generated && rm -f changelog/generated/$(RELEASE_VERSION).md
+	go run ./release/changelog/gen-changelog.go -tag=$(RELEASE_VERSION) -changelog=changelog/generated/$(RELEASE_VERSION).md
+	rm -f ./changelog/fragments/!(00-template.yaml)
+
+.PHONY: tag
+VERSION_REGEXP := ^v[0-9]+\.[0-9]+\.[0-9]+(\-(alpha|beta|rc)\.[0-9]+)?$
+tag: ## Create a release tag.
+ifeq (,$(RELEASE_VERSION))
+	$(error "RELEASE_VERSION must be set to tag HEAD")
+endif
+ifeq (,$(shell [[ "$(RELEASE_VERSION)" =~ $(VERSION_REGEXP) ]] && echo 1))
+	$(error "Version $(RELEASE_VERSION) must match regexp $(VERSION_REGEXP)")
+endif
+	git tag --sign --message "Operator SDK $(RELEASE_VERSION)" $(RELEASE_VERSION)
+	git verify-tag --verbose $(RELEASE_VERSION)
+
+##@ Image deploy
+
+# Convenience wrappers for pushing all remotely hosted images.
+.PHONY: image-push image-push-multiarch
+IMAGE_TARGET_LIST = operator-sdk helm-operator ansible-operator scorecard-test scorecard-test-kuttl
+image-push: $(foreach i,$(IMAGE_TARGET_LIST),image-push/$(i)) ## Push all images for the host architecture.
+image-push-multiarch: $(foreach i,$(IMAGE_TARGET_LIST),image-push-multiarch/$(i)) ## Push the manifest list for all architectures.
+
+# Push an image for an architecture.
+BUILD_IMAGE_REPO = quay.io/operator-framework
+IMAGE_REPO ?= $(BUILD_IMAGE_REPO)
+GO_ARCH := $(shell go env GOARCH)
+image-push/%: IMAGE_PUSH_TAG = $(IMAGE_REPO)/$*-$(GO_ARCH)
+image-push/%:
+	./hack/image/push-image-tags.sh $(BUILD_IMAGE_REPO)/$*:dev $(IMAGE_PUSH_TAG)
+
+# Push multiarch images.
+ARCHES ?= amd64 arm64 ppc64le s390x
+KUTTL_ARCHES := amd64 arm64 ppc64le
+image-push-multiarch/scorecard-test-kuttl: ARCHES = $(KUTTL_ARCHES)
+image-push-multiarch/%: IMAGE_PUSH_TAG = $(IMAGE_REPO)/$*
+image-push-multiarch/%:
+	./hack/image/push-manifest-list.sh $(IMAGE_PUSH_TAG) $(ARCHES)
+
+.DEFAULT_GOAL := help
+.PHONY: help
+help: ## Show this help screen.
+	@echo 'Usage: make <OPTIONS> ... <TARGETS>'
+	@echo ''
+	@echo 'Available targets are:'
+	@echo ''
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
